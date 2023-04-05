@@ -6,16 +6,16 @@ import sys
 import torch
 import pickle
 import openai
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
-from transformers import T5Tokenizer, T5ForConditionalGeneration
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from accelerate import infer_auto_device_map, init_empty_weights, Accelerator
+
+accelerator = Accelerator()
+
 
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 
-flan_t5_model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-xxl", device_map="auto")
-flan_t5_tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-xxl")
-
 ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
-SAVE_DIR = os.path.join(ROOT_DIR, 'saved_results')
+SAVE_DIR = os.path.join(ROOT_DIR, 'final/rat_chain')
 if not os.path.isdir(SAVE_DIR):
     os.mkdir(SAVE_DIR)
     print(f"mkdir at {SAVE_DIR} for saving results")
@@ -23,6 +23,7 @@ if not os.path.isdir(SAVE_DIR):
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
+        
         yield lst[i:i + n]
 
 def chunk_size_helper(params):
@@ -32,10 +33,11 @@ def chunk_size_helper(params):
     if bs is None:
         if 'gpt2' in params['model']:
             return 1
-        elif 'flan' in params['model']:
+            # 'opt'
+        elif 'gpt-j' in params['model']:
             return 1
         else:
-            assert params['model'] in ['ada', 'babbage', 'curie', 'davinci', 'ada-beta', 'babbage-beta', 'curie-beta', 'davinci-beta']
+            assert params['model'] in ['ada', 'babbage', 'curie', 'text-davinci-002', 'davinci', 'ada-beta', 'babbage-beta', 'curie-beta', 'davinci-beta']
             return 20
     else:
         return bs
@@ -68,29 +70,36 @@ def setup_gpt2(model_name):
         gpt2_model.config.pad_token_id = gpt2_model.config.eos_token_id
         print("Finished")
 
-flan_t5_model = None
-flan_t5_tokenizer = None
-def setup_flan_t5(model_name):
-    # load the flan t5 model
-    global flan_t5_model
-    global flan_t5_tokenizer
-    if flan_t5_model is None:
-        print("Setting up Flan T5-xxl model")
-        flan_t5_model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-xxl", device_map="auto")
-        flan_t5_model.eval().cuda()
+opt_model = None
+opt_tokenizer = None
+def setup_opt(model_name):
+
+    # facebook/opt-13b
+    global opt_model
+    global opt_tokenizer
+    if opt_model is None:
+        print("Setting up gpt-j-6b model")
         
-        # to batch generation, we pad on the left and mask those positions out.
-        flan_t5_tokenizer.padding_side = "left"
-        flan_t5_tokenizer.pad_token = flan_t5_tokenizer.eos_token
-        flan_t5_model.config.pad_token_id = flan_t5_model.config.eos_token_id
+        opt_model = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="balanced_low_0", offload_folder="offload", offload_state_dict = True, torch_dtype=torch.float16)
+
+        device_map = infer_auto_device_map(opt_model)
+        # device_map["model.decoder.layers.37"] = "disk"
+
+        opt_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        opt_tokenizer.padding_side = 'left'
+        opt_tokenizer.pad_token = opt_tokenizer.eos_token
+        opt_model.config.pad_token_id = opt_model.config.eos_token_id
         print("Finished")
+
 
 
 def setup_gpt3():
     # get OpenAI access key
-    with open(os.path.join(ROOT_DIR, 'openai_key.txt'), 'r') as f:
-        key = f.readline().strip()
-        openai.api_key = key
+    # with open(os.path.join(ROOT_DIR, 'openai_key.txt'), 'r') as f:
+    #     key = f.readline().strip()
+    #     openai.api_key = key
+    openai.api_key = "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"
 
 def complete_gpt2(prompt, l=10, model_name='gpt2-xl', num_log_probs=None, echo=False):
     ''' This function runs GPT-2 locally but places the outputs into an json that looks just like the one
@@ -103,10 +112,12 @@ def complete_gpt2(prompt, l=10, model_name='gpt2-xl', num_log_probs=None, echo=F
     if l > 0:
         # the generate function can handle left padded inputs automatically in HF
         # total_sequences is now the input + possible generated output
-        total_sequences = gpt2_model.generate(input_ids=input_ids['input_ids'].cuda(), attention_mask=input_ids['attention_mask'].cuda(), max_length=l + len(input_ids['input_ids'][0]), do_sample=False)
+        total_sequences = gpt2_model.generate(input_ids=input_ids['input_ids'].cuda(), attention_mask=input_ids['attention_mask'].cuda(), max_length=l + len(input_ids['input_ids'][0]), do_sample=True, temperature=1.0, top_p=0.8)
     else:
         assert echo == True and l == 0
         total_sequences = input_ids['input_ids'].cuda()
+        print('NO SAMPLING')
+        print()
 
     # they want the probs of the top tokens
     if num_log_probs is not None:
@@ -179,23 +190,24 @@ def complete_gpt2(prompt, l=10, model_name='gpt2-xl', num_log_probs=None, echo=F
         choices.append(curr_json)
     return_json['choices'] = choices
     return return_json
-
-
-def complete_flan_t5(prompt, l=10, model_name='flan-t5-xxl', num_log_probs=None, echo=False):
+# 'facebook/opt-66b'
+def complete_opt(prompt, l=10, model_name='ElutherAI/gpt-j-6B', num_log_probs=None, echo=False):
     ''' This function runs GPT-2 locally but places the outputs into an json that looks just like the one
      provided by the OpenAI API. '''
     if isinstance(prompt, str):
         prompt = [prompt] # the code below assumes a list
-    input_ids = flan_t5_tokenizer.batch_encode_plus(prompt, return_tensors="pt", padding=True)
+    input_ids = opt_tokenizer.batch_encode_plus(prompt, return_tensors="pt", padding=True)
     
     # greedily generate l tokens
     if l > 0:
         # the generate function can handle left padded inputs automatically in HF
         # total_sequences is now the input + possible generated output
-        total_sequences = flan_t5_model.generate(input_ids=input_ids['input_ids'].cuda(), attention_mask=input_ids['attention_mask'].cuda(), max_length=l + len(input_ids['input_ids'][0]), do_sample=False)
+        total_sequences = opt_model.generate(input_ids=input_ids['input_ids'].cuda(), attention_mask=input_ids['attention_mask'].cuda(), max_length=l + len(input_ids['input_ids'][0]), do_sample=False)
     else:
         assert echo == True and l == 0
         total_sequences = input_ids['input_ids'].cuda()
+        print('NO SAMPLING')
+        print()
 
     # they want the probs of the top tokens
     if num_log_probs is not None:
@@ -204,7 +216,8 @@ def complete_flan_t5(prompt, l=10, model_name='flan-t5-xxl', num_log_probs=None,
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
         # get the logits for the context and the next l tokens
-        logits = flan_t5_model.forward(input_ids=total_sequences, attention_mask=attention_mask, position_ids=position_ids, return_dict=True).logits.detach().cpu()
+        logits = opt_model.forward(input_ids=total_sequences, attention_mask=attention_mask, return_dict=True).logits.detach().cpu()
+        logits = logits.float()
         if not echo:
             # get the top tokens and probs for the generated l tokens
             probs = torch.softmax(logits[:,-l-1:], dim=2).cpu()
@@ -222,9 +235,9 @@ def complete_flan_t5(prompt, l=10, model_name='flan-t5-xxl', num_log_probs=None,
         curr_json = {}
         # text is just the optional context and next l tokens
         if not echo:
-            curr_json['text'] = flan_t5_tokenizer.decode(total_sequences[batch_id][-l:], skip_special_tokens=True)
+            curr_json['text'] = opt_tokenizer.decode(total_sequences[batch_id][-l:], skip_special_tokens=True)
         else:
-            curr_json['text'] = flan_t5_tokenizer.decode(total_sequences[batch_id], skip_special_tokens=True)
+            curr_json['text'] = opt_tokenizer.decode(total_sequences[batch_id], skip_special_tokens=True)
 
         # fill the return json with the top tokens and probs to match the OpenAI return value.
         if num_log_probs is not None:
@@ -236,13 +249,13 @@ def complete_flan_t5(prompt, l=10, model_name='flan-t5-xxl', num_log_probs=None,
                 # cutoff the -1 here because the probs are shifted one over for LMs
                 for current_element_top_log_probs, current_element_top_tokens in zip(top_log_probs[batch_id][:-1], top_tokens[batch_id][:-1]):
                     # tokens is a list of the top token at each position
-                    curr_json['logprobs']['tokens'].append(flan_t5_tokenizer.decode([current_element_top_tokens[0]]))
+                    curr_json['logprobs']['tokens'].append(opt_tokenizer.decode([current_element_top_tokens[0]]))
                     # token_logprobs is a list of the logprob of the top token at each position
                     curr_json['logprobs']['token_logprobs'].append(current_element_top_log_probs[0].item())
                     # top_logprobs is a list of dicts for the top K tokens. with each entry being {'token_name': log_prob}
                     temp = {}
                     for log_prob, token in zip(current_element_top_log_probs, current_element_top_tokens):
-                        temp[flan_t5_tokenizer.decode(token.item())] = log_prob.item()
+                        temp[opt_tokenizer.decode(token.item())] = log_prob.item()
                     curr_json['logprobs']['top_logprobs'].append(temp)
             else:
                 # same as not above but small tweaks
@@ -256,10 +269,10 @@ def complete_flan_t5(prompt, l=10, model_name='flan-t5-xxl', num_log_probs=None,
                         continue
                     temp = {}
                     for log_prob, token in zip(current_element_top_log_probs, current_element_top_tokens):
-                        temp[flan_t5_tokenizer.decode(token.item())] = log_prob.item()
+                        temp[opt_tokenizer.decode(token.item())] = log_prob.item()
                     curr_json['logprobs']['top_logprobs'].append(temp)
                 for index in range(len(probs[batch_id])):
-                    curr_json['logprobs']['tokens'].append(flan_t5_tokenizer.decode([total_sequences[batch_id][index]]))
+                    curr_json['logprobs']['tokens'].append(opt_tokenizer.decode([total_sequences[batch_id][index]]))
                 curr_json['logprobs']['token_logprobs'].append('null')
                 for index, log_probs_token_position_j in enumerate(logprobs[batch_id][:-1]):
                     # probs are left shifted for LMs 
@@ -271,14 +284,13 @@ def complete_flan_t5(prompt, l=10, model_name='flan-t5-xxl', num_log_probs=None,
 
 
 
-
 def complete_gpt3(prompt, l, model_name, temp=0, num_log_probs=None, echo=False, n=None):
     # call GPT-3 API until result is provided and then return it
     response = None
     received = False
     while not received:
         try:
-            response = openai.Completion.create(engine=model_name, prompt=prompt, max_tokens=l, temperature=temp,
+            response = openai.Completion.create(engine=model_name, prompt=prompt, max_tokens=l, temperature=0,
                                                 logprobs=num_log_probs, echo=echo, stop='\n', n=n)
             received = True
         except:
@@ -297,14 +309,13 @@ def complete(prompt, l, model, temp=0, num_log_probs=None, echo=False, n=None):
     assert temp >= 0
     if 'gpt2' in model:
         assert n == None # unsupported at the moment
-        assert temp == 0 # unsupported at the moment
+        # assert temp == 0 # unsupported at the moment
         setup_gpt2(model)
         return complete_gpt2(prompt, l=l, model_name=model, num_log_probs=num_log_probs, echo=echo)
-    elif 'flan' in model:
+    elif 'gpt-j' in model:
         assert n == None
-        assert temp == 0
-        setup_flan_t5(model)
-        return complete_flan_t5(prompt, l=l, model_name=model, num_log_probs=num_log_probs, echo=echo)
+        setup_opt(model)
+        return complete_opt(prompt, l=l, model_name=model, num_log_probs=num_log_probs, echo=echo)
     
     else:
         setup_gpt3()
