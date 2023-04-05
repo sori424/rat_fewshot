@@ -99,7 +99,7 @@ def setup_gpt3():
     # with open(os.path.join(ROOT_DIR, 'openai_key.txt'), 'r') as f:
     #     key = f.readline().strip()
     #     openai.api_key = key
-    openai.api_key = "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"
+    openai.api_key = ""
 
 def complete_gpt2(prompt, l=10, model_name='gpt2-xl', num_log_probs=None, echo=False):
     ''' This function runs GPT-2 locally but places the outputs into an json that looks just like the one
