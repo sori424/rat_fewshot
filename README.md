@@ -23,7 +23,7 @@ Here is how to replicate the results for GPT-2. To replicate the results for cla
 
 
 ```
-CUDA_VISIBLE_DEVICES=0 python test.py \
+CUDA_VISIBLE_DEVICES=0 python testst.py \
 --model="gpt2-xl" \
 --dataset="rat_reason, rat" \
 --num_seeds=5 \
